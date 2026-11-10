@@ -1,0 +1,26 @@
+---
+import Layout from "../layouts/Layout.astro";
+import TodoApp from "../components/TodoApp.astro";
+
+import { db } from "../db";
+import { todos } from "../db/schema";
+import { asc } from "drizzle-orm";
+
+Astro.response.headers.set("Cache-Control", "no-store");
+
+const initialTodos = await db
+  .select({
+    id: todos.id,
+    text: todos.title,
+    done: todos.completed,
+  })
+  .from(todos)
+  .orderBy(asc(todos.id));
+---
+
+<Layout title="TODO | Astro Demo">
+  <main class="mx-auto max-w-md px-4 py-12">
+    <h1 class="mb-6 text-3xl font-bold tracking-tight">TODO</h1>
+    <TodoApp initialTodos={initialTodos} />
+  </main>
+</Layout>

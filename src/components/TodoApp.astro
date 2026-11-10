@@ -1,0 +1,275 @@
+---
+// ===== サーバー側 =====
+// Astro コンポーネントは HTML を1回生成するだけ。再レンダリングはされない。
+// なので useState のような「状態」はここには持てない。
+export interface Todo {
+  id: number;
+  text: string;
+  done: boolean;
+}
+interface Props {
+  initialTodos: Todo[];
+}
+const { initialTodos } = Astro.props;
+---
+
+<!--
+  サーバーから渡すデータは data-* 属性に JSON で埋め込み、ブラウザ側のスクリプトで読む。
+  （<script> は frontmatter の変数を直接参照できないため）
+-->
+<todo-app data-initial={JSON.stringify(initialTodos)} class="block">
+  <p data-error role="alert" hidden></p>
+  <p data-sync-error role="status" hidden></p>
+  <form data-form class="mb-4 flex gap-2">
+    <input
+      data-input
+      type="text"
+      placeholder="やることを入力"
+      class="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200"
+    />
+    <button
+      type="submit"
+      class="rounded-lg bg-indigo-600 px-4 py-2 font-medium text-white hover:bg-indigo-700 active:bg-indigo-800"
+    >
+      追加
+    </button>
+  </form>
+
+  <div class="mb-3 flex gap-1 text-sm" data-filters>
+    <button data-filter="all" class="filter-btn">すべて</button>
+    <button data-filter="active" class="filter-btn">未完了</button>
+    <button data-filter="done" class="filter-btn">完了</button>
+  </div>
+
+  <!-- 初期 HTML もサーバーで描画しておく（JS が動く前から中身が見える） -->
+  <ul
+    data-list
+    class="divide-y divide-slate-200 overflow-hidden rounded-lg bg-white shadow-sm"
+  >
+    {
+      initialTodos.map((todo) => (
+        <li class="flex items-center gap-3 px-4 py-3">
+          <input
+            type="checkbox"
+            checked={todo.done}
+            class="size-4 accent-indigo-600"
+          />
+          <span
+            class:list={["flex-1", todo.done && "text-slate-400 line-through"]}
+          >
+            {todo.text}
+          </span>
+        </li>
+      ))
+    }
+  </ul>
+
+  <p data-count class="mt-3 text-sm text-slate-500"></p>
+
+  <!-- 1件分の見た目。JS からこれを複製して使う（JSX の代わり） -->
+  <template data-item-template>
+    <li class="group flex items-center gap-3 px-4 py-3">
+      <input type="checkbox" class="size-4 accent-indigo-600" />
+      <span class="flex-1"></span>
+      <button
+        data-delete
+        class="text-slate-400 opacity-0 transition group-hover:opacity-100 hover:text-red-500"
+        aria-label="削除">✕</button
+      >
+    </li>
+  </template>
+</todo-app>
+
+<style>
+  @reference "../styles/global.css";
+  .filter-btn {
+    @apply rounded-md px-3 py-1 text-slate-600 hover:bg-slate-200;
+  }
+  .filter-btn[aria-pressed="true"] {
+    @apply bg-indigo-600 text-white hover:bg-indigo-600;
+  }
+</style>
+
+<script>
+  // ===== ブラウザ側 =====
+  // <script> は自動でバンドルされ、ページに1回だけ読み込まれる（TypeScript も OK）。
+  type Todo = { id: number; text: string; done: boolean };
+  type Filter = "all" | "active" | "done";
+
+
+  class TodoApp extends HTMLElement {
+    // ---- useState 相当：ただの変数 + 「変更したら render() を呼ぶ」 ----
+    #todos: Todo[] = [];
+    #filter: Filter = "all";
+    #busy = false;
+    #initialized = false;
+    #pollTimer: ReturnType<typeof setInterval> | undefined;
+    #pollRequest: AbortController | undefined;
+
+    #setTodos(next: Todo[]) {
+      this.#todos = next;
+      this.#render(); // React なら自動で再レンダリングされる部分を手動で
+    }
+
+    #setFilter(next: Filter) {
+      this.#filter = next;
+      this.#render();
+    }
+
+    // DOM に接続されるたびに定期取得を開始。イベント登録と初期化は1回だけ。
+    connectedCallback() {
+      if (this.#pollTimer !== undefined) return;
+      this.#pollTimer = setInterval(() => void this.#refreshTodos(), 30_000);
+      if (this.#initialized) return;
+      this.#initialized = true;
+      this.#todos = JSON.parse(this.dataset.initial ?? "[]");
+
+      this.querySelector("[data-form]")!.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const input = this.querySelector<HTMLInputElement>("[data-input]")!;
+        const text = input.value.trim();
+        if (!text) return;
+        if (this.#busy) return;
+        await this.#mutate(async () => {
+          const todo = await this.#request("POST", { text });
+          this.#setTodos([...this.#todos, todo]);
+          input.value = "";
+        });
+      });
+
+      this.querySelector("[data-filters]")!.addEventListener("click", (e) => {
+        const btn = (e.target as HTMLElement).closest<HTMLElement>(
+          "[data-filter]",
+        );
+        if (btn) this.#setFilter(btn.dataset.filter as Filter);
+      });
+
+      this.#render();
+    }
+
+    disconnectedCallback() {
+      clearInterval(this.#pollTimer);
+      this.#pollTimer = undefined;
+      this.#pollRequest?.abort();
+      this.#pollRequest = undefined;
+    }
+
+    // 保存中や前の取得が未完了の場合はスキップする。
+    async #refreshTodos() {
+      if (this.#busy || this.#pollRequest || !this.isConnected) return;
+      const controller = new AbortController();
+      this.#pollRequest = controller;
+      const error = this.querySelector<HTMLElement>("[data-sync-error]")!;
+      try {
+        const response = await fetch("/api/todos", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("TODOの定期取得に失敗しました。次回再試行します。");
+        const todos: Todo[] = await response.json();
+        // 保存開始やDOMからの取り外し後に古い取得結果を反映しない。
+        if (controller.signal.aborted || !this.isConnected) return;
+        this.#setTodos(todos);
+        error.hidden = true;
+      } catch {
+        if (controller.signal.aborted) return;
+        error.textContent = "TODOの定期取得に失敗しました。次回再試行します。";
+        error.hidden = false;
+      } finally {
+        if (this.#pollRequest === controller) this.#pollRequest = undefined;
+      }
+    }
+
+    async #request(method: string, body: object): Promise<Todo> {
+      const response = await fetch("/api/todos", {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? "保存に失敗しました。");
+      return data;
+    }
+
+    async #mutate(action: () => Promise<void>) {
+      if (this.#busy) return;
+      this.#pollRequest?.abort();
+      this.#pollRequest = undefined;
+      this.#busy = true;
+      const error = this.querySelector<HTMLElement>("[data-error]")!;
+      error.hidden = true;
+      this.#render();
+      try {
+        await action();
+      } catch (cause) {
+        error.textContent = cause instanceof Error ? cause.message : "保存に失敗しました。";
+        error.hidden = false;
+      } finally {
+        this.#busy = false;
+        this.#render();
+      }
+    }
+
+    // ---- 状態 → DOM。React の return (<JSX/>) に当たる部分 ----
+    #render() {
+      this.querySelector<HTMLButtonElement>('[type="submit"]')!.disabled = this.#busy;
+      const list = this.querySelector("[data-list]")!;
+      const tpl = this.querySelector<HTMLTemplateElement>(
+        "[data-item-template]",
+      )!;
+
+      const visible = this.#todos.filter((t) =>
+        this.#filter === "all"
+          ? true
+          : this.#filter === "done"
+            ? t.done
+            : !t.done,
+      );
+
+      list.replaceChildren(
+        ...visible.map((todo) => {
+          const li = tpl.content.firstElementChild!.cloneNode(
+            true,
+          ) as HTMLLIElement;
+          const checkbox = li.querySelector("input")!;
+          const label = li.querySelector("span")!;
+
+          checkbox.checked = todo.done;
+          label.textContent = todo.text;
+          label.classList.toggle("line-through", todo.done);
+          label.classList.toggle("text-slate-400", todo.done);
+
+          checkbox.disabled = this.#busy;
+          checkbox.addEventListener("change", () => {
+            void this.#mutate(async () => {
+              const updated = await this.#request("PATCH", { id: todo.id, done: checkbox.checked });
+              this.#setTodos(this.#todos.map((t) => t.id === todo.id ? updated : t));
+            });
+          });
+          const deleteButton = li.querySelector<HTMLButtonElement>("[data-delete]")!;
+          deleteButton.disabled = this.#busy;
+          deleteButton.addEventListener("click", () => {
+            void this.#mutate(async () => {
+              await this.#request("DELETE", { id: todo.id });
+              this.#setTodos(this.#todos.filter((t) => t.id !== todo.id));
+            });
+          });
+          return li;
+        }),
+      );
+
+      for (const btn of this.querySelectorAll<HTMLElement>("[data-filter]")) {
+        btn.setAttribute(
+          "aria-pressed",
+          String(btn.dataset.filter === this.#filter),
+        );
+      }
+
+      const left = this.#todos.filter((t) => !t.done).length;
+      this.querySelector("[data-count]")!.textContent =
+        `残り ${left} 件 / 全 ${this.#todos.length} 件`;
+    }
+  }
+
+  customElements.define("todo-app", TodoApp);
+</script>
