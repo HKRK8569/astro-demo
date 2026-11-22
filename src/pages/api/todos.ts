@@ -1,60 +1,79 @@
 import type { APIRoute } from 'astro';
 import { asc, eq } from 'drizzle-orm';
+import { Hono } from 'hono';
 import { db } from '../../db';
 import { todos } from '../../db/schema';
 
+const path = '/api/todos';
+const app = new Hono<{ Variables: { body: Record<string, unknown> } }>({ strict: false });
 const fields = { id: todos.id, text: todos.title, done: todos.completed };
-const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
-  status,
-  headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+
+function isTodoId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0 && id <= 2147483647;
+}
+
+app.use(path, async (c, next) => {
+  c.header('Cache-Control', 'no-store');
+  await next();
 });
 
-export const GET: APIRoute = async () => {
-  try {
-    return json(await db.select(fields).from(todos).orderBy(asc(todos.id)));
-  } catch (error) {
+app.onError((error, c) => {
+  if (c.req.method === 'GET' || c.req.method === 'HEAD') {
     console.error('Todo read failed', error);
-    return json({ error: 'TODOの取得に失敗しました。' }, 500);
+    return c.json({ error: 'TODOの取得に失敗しました。' }, 500);
   }
-};
+  console.error('Todo mutation failed', error);
+  return c.json({ error: 'TODOの保存に失敗しました。もう一度お試しください。' }, 500);
+});
 
-const mutate: APIRoute = async ({ request, url }) => {
-  const origin = request.headers.get('origin');
-  if (origin && origin !== url.origin) return json({ error: '不正なリクエストです。' }, 403);
+app.get(path, async (c) => {
+  return c.json(await db.select(fields).from(todos).orderBy(asc(todos.id)));
+});
+
+app.on(['POST', 'PATCH', 'DELETE'], path, async (c, next) => {
+  const origin = c.req.header('Origin');
+  if (origin && origin !== new URL(c.req.url).origin) {
+    return c.json({ error: '不正なリクエストです。' }, 403);
+  }
   let body;
   try {
-    body = await request.json();
+    body = await c.req.json<Record<string, unknown>>();
   } catch {
-    return json({ error: 'JSONを指定してください。' }, 400);
+    return c.json({ error: 'JSONを指定してください。' }, 400);
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return json({ error: '入力が不正です。' }, 400);
+    return c.json({ error: '入力が不正です。' }, 400);
   }
-  try {
-    if (request.method === 'POST') {
-      if (typeof body.text !== 'string' || !body.text.trim()) {
-        return json({ error: 'やることを入力してください。' }, 400);
-      }
-      const [todo] = await db.insert(todos).values({ title: body.text.trim() }).returning(fields);
-      return json(todo, 201);
-    }
-    if (!Number.isSafeInteger(body.id) || body.id <= 0 || body.id > 2147483647) {
-      return json({ error: 'IDが不正です。' }, 400);
-    }
-    if (request.method === 'PATCH') {
-      if (typeof body.done !== 'boolean') return json({ error: '完了状態が不正です。' }, 400);
-      const [todo] = await db.update(todos).set({ completed: body.done })
-        .where(eq(todos.id, body.id)).returning(fields);
-      return todo ? json(todo) : json({ error: 'TODOが見つかりません。' }, 404);
-    }
-    const [todo] = await db.delete(todos).where(eq(todos.id, body.id)).returning(fields);
-    return todo ? json(todo) : json({ error: 'TODOが見つかりません。' }, 404);
-  } catch (error) {
-    console.error('Todo mutation failed', error);
-    return json({ error: 'TODOの保存に失敗しました。もう一度お試しください。' }, 500);
-  }
-};
+  c.set('body', body);
+  await next();
+});
 
-export const POST = mutate;
-export const PATCH = mutate;
-export const DELETE = mutate;
+app.post(path, async (c) => {
+  const { text } = c.var.body;
+  if (typeof text !== 'string' || !text.trim()) {
+    return c.json({ error: 'やることを入力してください。' }, 400);
+  }
+  const [todo] = await db.insert(todos).values({ title: text.trim() }).returning(fields);
+  return c.json(todo, 201);
+});
+
+app.patch(path, async (c) => {
+  const { id, done } = c.var.body;
+  if (!isTodoId(id)) return c.json({ error: 'IDが不正です。' }, 400);
+  if (typeof done !== 'boolean') return c.json({ error: '完了状態が不正です。' }, 400);
+
+  const [todo] = await db.update(todos).set({ completed: done })
+    .where(eq(todos.id, id)).returning(fields);
+  return todo ? c.json(todo) : c.json({ error: 'TODOが見つかりません。' }, 404);
+});
+
+app.delete(path, async (c) => {
+  const { id } = c.var.body;
+  if (!isTodoId(id)) return c.json({ error: 'IDが不正です。' }, 400);
+
+  const [todo] = await db.delete(todos).where(eq(todos.id, id)).returning(fields);
+  return todo ? c.json(todo) : c.json({ error: 'TODOが見つかりません。' }, 404);
+});
+
+const handle: APIRoute = ({ request }) => app.fetch(request);
+export { handle as GET, handle as POST, handle as PATCH, handle as DELETE };
